@@ -20,6 +20,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
@@ -323,36 +325,69 @@ func TestOpenAIGenerate(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	t.Run("custom headers from config", func(t *testing.T) {
-		defer mockey.Mock((*openai.Client).CreateChatCompletion).To(func(ctx context.Context,
-			request openai.ChatCompletionRequest, opts ...openai.ChatCompletionRequestOption) (response openai.ChatCompletionResponse, err error) {
-			if len(opts) != 1 {
-				t.Fatalf("expected one request option for custom headers, got %d", len(opts))
-			}
-			return openai.ChatCompletionResponse{
-				Choices: []openai.ChatCompletionChoice{
-					{
-						Message: openai.ChatCompletionMessage{
-							Role:    openai.ChatMessageRoleAssistant,
-							Content: "ok",
-						},
-					},
-				},
-			}, nil
-		}).Build().UnPatch()
+}
 
-		ctx := context.Background()
-		m, err := NewChatModel(ctx, &ChatModelConfig{
-			APIKey:        "test-key",
-			Model:         "gpt-4",
-			CustomHeaders: map[string]string{"X-Custom": "value"},
+func TestChatModelCustomHeaders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Stream bool `json:"stream"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		traceID := r.Header.Get("X-Trace-Id")
+		if request.Stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":%q}}]}\n\ndata: [DONE]\n\n", traceID)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"choices":[{"message":{"role":"assistant","content":%q}}]}`, traceID)
+	}))
+	defer server.Close()
+
+	ctx := context.Background()
+	m, err := NewChatModel(ctx, &ChatModelConfig{
+		BaseURL:       server.URL,
+		Model:         "test-model",
+		CustomHeaders: map[string]string{"X-Trace-Id": "default-trace"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := []*schema.Message{schema.UserMessage("hello")}
+	for _, tc := range []struct {
+		name string
+		opts []model.Option
+		want string
+	}{
+		{"Generate", nil, "default-trace"},
+		{"GenerateWithOverride", []model.Option{WithExtraHeader(map[string]string{"X-Trace-Id": "request-trace"})}, "request-trace"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg, err := m.Generate(ctx, messages, tc.opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if msg.Content != tc.want {
+				t.Fatalf("server received X-Trace-Id %q, want %q", msg.Content, tc.want)
+			}
 		})
+	}
+
+	t.Run("Stream", func(t *testing.T) {
+		stream, err := m.Stream(ctx, messages)
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, err = m.Generate(ctx, []*schema.Message{schema.UserMessage("hello")})
+		defer stream.Close()
+		msg, err := stream.Recv()
 		if err != nil {
 			t.Fatal(err)
+		}
+		if msg.Content != "default-trace" {
+			t.Fatalf("server received X-Trace-Id %q, want default-trace", msg.Content)
 		}
 	})
 }
